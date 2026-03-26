@@ -1,0 +1,4 @@
+aiogram>=3.25
+aiosqlite
+python-dotenv
+aiohttp

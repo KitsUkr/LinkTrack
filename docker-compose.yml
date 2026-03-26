@@ -1,0 +1,20 @@
+services:
+  bot:
+    build: .
+    container_name: link_tracking_bot
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+      - bot_data:/app/data
+      - ./logs:/app/logs
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot_data:
