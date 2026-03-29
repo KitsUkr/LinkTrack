@@ -61,7 +61,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     """Клавіатура головного меню."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📡 Канали", callback_data="channels")]
+            [InlineKeyboardButton(text="📡 Канали", callback_data="channels")],
+            [InlineKeyboardButton(text="✏️ Створити посилання", callback_data="quick_create_link")],
         ]
     )
 
@@ -127,6 +128,47 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.callback_query(F.data.in_({"main_menu", "cancel"}))
 async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     await show_main_menu(callback, state)
+
+# ═══════════════════════════════════════════════════════════
+#   Швидке створення посилання — вибір каналу з меню
+# ═══════════════════════════════════════════════════════════
+@router.callback_query(F.data == "quick_create_link")
+async def cb_quick_create_link(callback: CallbackQuery):
+    """Показує список каналів для швидкого створення посилання."""
+    channels = await get_all_channels()
+
+    if not channels:
+        await callback.message.edit_text(
+            "📭 <b>Немає підключених каналів</b>\n\n"
+            "Спочатку додайте бота адміністратором у канал — "
+            "він з'явиться тут автоматично.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📡 Перейти до каналів", callback_data="channels")],
+                    [InlineKeyboardButton(text="« В меню", callback_data="main_menu")],
+                ]
+            ),
+        )
+        await callback.answer()
+        return
+
+    buttons = []
+    for ch in channels:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📡 {ch['chat_title']}",
+                callback_data=f"create_link:{ch['id']}:from_menu",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="« В меню", callback_data="main_menu")])
+
+    await callback.message.edit_text(
+        "✏️ <b>Створити посилання</b>\n\n"
+        "Оберіть канал для якого створити посилання:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await callback.answer()
+
 
 # ═══════════════════════════════════════════════════════════
 #   Канали — список, деталі, видалення
@@ -317,11 +359,15 @@ async def cb_delete_channel(callback: CallbackQuery):
 # ═══════════════════════════════════════════════════════════
 @router.callback_query(F.data.startswith("create_link:"))
 async def cb_create_link(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
     try:
-        (channel_id,) = parse_callback_ids(callback.data, 1)
-    except (ValueError, IndexError):
+        channel_id = int(parts[1])
+    except (IndexError, ValueError):
         await callback.answer("❌ Некоректний ID", show_alert=True)
         return
+
+    from_menu = len(parts) > 2 and parts[2] == "from_menu"
+    cancel_cb = "quick_create_link" if from_menu else f"ch_detail:{channel_id}"
 
     ch = await get_channel(channel_id)
     if not ch:
@@ -329,16 +375,24 @@ async def cb_create_link(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(
-        chat_id=ch["chat_id"], chat_title=ch["chat_title"], channel_id=channel_id,
+        chat_id=ch["chat_id"],
+        chat_title=ch["chat_title"],
+        channel_id=channel_id,
+        from_menu=from_menu,
+        cancel_cb=cancel_cb,
         bot_msg_id=callback.message.message_id,
     )
     await state.set_state(CreateLinkFSM.waiting_campaign_name)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="« Скасувати", callback_data=cancel_cb)],
+    ])
 
     await callback.message.edit_text(
         f"📝 <b>Створити посилання</b>\n\n"
         f"📡 Канал: <b>{ch['chat_title']}</b>\n\n"
         f"Введіть <b>назву для посилання</b>:",
-        reply_markup=back_to_channel_kb(channel_id),
+        reply_markup=cancel_kb,
     )
     await callback.answer()
 
@@ -348,6 +402,7 @@ async def fsm_campaign_name(message: Message, state: FSMContext):
     data = await state.get_data()
     bot_msg_id = data.get("bot_msg_id")
     channel_id = data.get("channel_id")
+    cancel_cb = data.get("cancel_cb", f"ch_detail:{channel_id}" if channel_id else "main_menu")
     chat = message.chat.id
 
     # Видаляємо повідомлення користувача
@@ -356,12 +411,16 @@ async def fsm_campaign_name(message: Message, state: FSMContext):
     except Exception:
         pass
 
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="« Скасувати", callback_data=cancel_cb)],
+    ])
+
     campaign_name = message.text
     if not campaign_name:
         await message.bot.edit_message_text(
             "⚠️ Надішліть текстове повідомлення.",
             chat_id=chat, message_id=bot_msg_id,
-            reply_markup=back_to_channel_kb(channel_id),
+            reply_markup=cancel_kb,
         )
         return
 
@@ -370,23 +429,26 @@ async def fsm_campaign_name(message: Message, state: FSMContext):
         await message.bot.edit_message_text(
             "⚠️ Назва не може бути порожньою. Введіть назву для посилання:",
             chat_id=chat, message_id=bot_msg_id,
-            reply_markup=back_to_channel_kb(channel_id),
+            reply_markup=cancel_kb,
         )
         return
 
     chat_id = data["chat_id"]
     chat_title = data["chat_title"]
+    from_menu = data.get("from_menu", False)
     await state.clear()
 
-    kb = (
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="« Назад", callback_data=f"ch_detail:{channel_id}")],
-            ]
-        )
-        if channel_id
-        else back_menu_kb()
-    )
+    # Після успіху — кнопка «Назад» повертає туди, звідки прийшли
+    if from_menu:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« В меню", callback_data="main_menu")],
+        ])
+    elif channel_id:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="« Назад", callback_data=f"ch_detail:{channel_id}")],
+        ])
+    else:
+        kb = back_menu_kb()
 
     try:
         invite = await message.bot.create_chat_invite_link(
