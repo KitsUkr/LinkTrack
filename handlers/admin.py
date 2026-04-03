@@ -1,4 +1,5 @@
 import logging
+import math
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
+PAGE_SIZE = 5
+
 # ─── Утиліти ──────────────────────────────────────────────
 def parse_callback_ids(data: str, count: int = 1) -> tuple[int, ...]:
     """Парсить ID з callback_data формату 'prefix:id1:id2:...'
@@ -40,6 +43,37 @@ def parse_callback_ids(data: str, count: int = 1) -> tuple[int, ...]:
         else:
             result.append(None)
     return tuple(result)
+
+
+def _pagination_row(
+    current_page: int,
+    total_items: int,
+    cb_prefix: str,
+) -> list[InlineKeyboardButton]:
+    total_pages = math.ceil(total_items / PAGE_SIZE)
+    if total_pages <= 1:
+        return []
+
+    row: list[InlineKeyboardButton] = []
+
+    if current_page > 0:
+        row.append(InlineKeyboardButton(
+            text="«",
+            callback_data=f"{cb_prefix}:{current_page - 1}",
+        ))
+
+    row.append(InlineKeyboardButton(
+        text=f"{current_page + 1}/{total_pages}",
+        callback_data="noop",
+    ))
+
+    if current_page < total_pages - 1:
+        row.append(InlineKeyboardButton(
+            text="»",
+            callback_data=f"{cb_prefix}:{current_page + 1}",
+        ))
+
+    return row  # ← один список = один рядок в клавіатурі
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -103,6 +137,11 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.callback_query(F.data.in_({"main_menu", "cancel"}))
 async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     await show_main_menu(callback, state)
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    await callback.answer()
 
 
 # ══════════════════════════════════════════════════════════
@@ -174,10 +213,18 @@ async def cb_add_channel(callback: CallbackQuery):
     await callback.answer()
 
 
-def _build_channels_list(channels: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+def _build_channels_list(
+    channels: list[dict],
+    page: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    total = len(channels)
+    start = page * PAGE_SIZE
+    page_channels = channels[start : start + PAGE_SIZE]
+
     text = "📡 <b>Канали</b>\n\n"
-    buttons = []
-    for ch in channels:
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    for ch in page_channels:
         text += f"• <b>{ch['chat_title']}</b>\n"
         buttons.append([
             InlineKeyboardButton(
@@ -185,13 +232,21 @@ def _build_channels_list(channels: list[dict]) -> tuple[str, InlineKeyboardMarku
                 callback_data=f"ch_detail:{ch['id']}",
             )
         ])
+
     text += "\n💡 Щоб додати ще — призначте бота адміністратором каналу."
+
+    # ── Пагінація ──
+    nav = _pagination_row(page, total, "channels_p")
+    if nav:
+        buttons.append(nav)
+
     buttons.append([InlineKeyboardButton(text="➕ Додати канал", callback_data="add_channel")])
     buttons.append([InlineKeyboardButton(text="« В меню", callback_data="main_menu")])
+
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def _render_channels_page(callback: CallbackQuery):
+async def _render_channels_page(callback: CallbackQuery, page: int = 0):
     owner_id = callback.from_user.id
     channels = await get_all_channels(owner_id)
 
@@ -209,14 +264,30 @@ async def _render_channels_page(callback: CallbackQuery):
             ]
         )
     else:
-        text, kb = _build_channels_list(channels)
+        # Clamp page to valid range
+        max_page = max(0, math.ceil(len(channels) / PAGE_SIZE) - 1)
+        page = min(page, max_page)
+        text, kb = _build_channels_list(channels, page)
 
     await callback.message.edit_text(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "channels")
 async def cb_channels(callback: CallbackQuery):
-    await _render_channels_page(callback)
+    await _render_channels_page(callback, page=0)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("channels_p:"))
+async def cb_channels_page(callback: CallbackQuery):
+    """Навігація між сторінками списку каналів."""
+    try:
+        page = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("❌ Некоректна сторінка", show_alert=True)
+        return
+
+    await _render_channels_page(callback, page=page)
     await callback.answer()
 
 
@@ -313,7 +384,7 @@ async def cb_delete_channel(callback: CallbackQuery):
     else:
         await callback.answer("❌ Канал не знайдено", show_alert=True)
 
-    await _render_channels_page(callback)
+    await _render_channels_page(callback, page=0)
 
 
 # ══════════════════════════════════════════════════════════
@@ -453,10 +524,10 @@ async def fsm_campaign_name(message: Message, state: FSMContext):
 
 
 # ══════════════════════════════════════════════════════════
-#   Список посилань (по каналу)
+#   Список посилань (по каналу) з пагінацією
 # ══════════════════════════════════════════════════════════
 
-async def _render_links_page(callback: CallbackQuery, channel_id: int):
+async def _render_links_page(callback: CallbackQuery, channel_id: int, page: int = 0):
     owner_id = callback.from_user.id
 
     ch = await get_channel(channel_id, owner_id)
@@ -486,10 +557,18 @@ async def _render_links_page(callback: CallbackQuery, channel_id: int):
         )
         return
 
-    text_lines = [f"📊 <b>Посилання каналу «{ch['chat_title']}»:</b>\n"]
-    buttons = []
+    # Clamp page to valid range
+    total = len(links)
+    max_page = max(0, math.ceil(total / PAGE_SIZE) - 1)
+    page = min(page, max_page)
 
-    for link in links:
+    start = page * PAGE_SIZE
+    page_links = links[start : start + PAGE_SIZE]
+
+    text_lines = [f"📊 <b>Посилання каналу «{ch['chat_title']}»:</b>\n"]
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    for link in page_links:
         joined = link["joined_count"]
         left = link["left_count"]
         text_lines.append(
@@ -502,12 +581,18 @@ async def _render_links_page(callback: CallbackQuery, channel_id: int):
             )
         ])
 
+    # ── Пагінація ──
+    nav = _pagination_row(page, total, f"show_links_p:{channel_id}")
+    if nav:
+        buttons.append(nav)
+
     buttons.append([
         InlineKeyboardButton(text="« Назад", callback_data=f"ch_detail:{channel_id}")
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     text = "\n".join(text_lines)
+    # Safety trim (should rarely trigger with pagination, but kept as last resort)
     if len(text) > 4000:
         text = text[:3950] + "\n\n<i>…список скорочено</i>"
 
@@ -522,7 +607,22 @@ async def cb_show_links(callback: CallbackQuery):
         await callback.answer("❌ Некоректний ID", show_alert=True)
         return
 
-    await _render_links_page(callback, channel_id)
+    await _render_links_page(callback, channel_id, page=0)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("show_links_p:"))
+async def cb_show_links_page(callback: CallbackQuery):
+    """Навігація між сторінками списку посилань: show_links_p:{channel_id}:{page}"""
+    parts = callback.data.split(":")
+    try:
+        channel_id = int(parts[1])
+        page = int(parts[2])
+    except (IndexError, ValueError):
+        await callback.answer("❌ Некоректні параметри", show_alert=True)
+        return
+
+    await _render_links_page(callback, channel_id, page=page)
     await callback.answer()
 
 
@@ -627,9 +727,9 @@ async def cb_delete_link(callback: CallbackQuery):
         await callback.answer("❌ Помилка при деактивації посилання.", show_alert=True)
 
     if channel_id:
-        await _render_links_page(callback, channel_id)
+        await _render_links_page(callback, channel_id, page=0)
     else:
-        await _render_channels_page(callback)
+        await _render_channels_page(callback, page=0)
 
 
 # ══════════════════════════════════════════════════════════
